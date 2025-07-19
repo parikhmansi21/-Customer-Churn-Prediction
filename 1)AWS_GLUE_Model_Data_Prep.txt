@@ -1,0 +1,461 @@
+import pandas as pd
+import numpy as np
+import os
+import pg8000 as pg
+import boto3
+import json
+import datetime
+from datetime import datetime
+from datetime import timedelta
+from datetime import date
+import logging as log
+from pyspark.sql import SparkSession
+from pyspark.sql import SQLContext
+from pyspark.sql.functions import col,lit,concat,udf,month,year,to_date,countDistinct,sum,concat_ws,max,unix_timestamp
+from pyspark.sql import functions as f
+from pyspark.sql.types import DateType
+from pyspark.sql.types import *
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.dynamicframe import DynamicFrame
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from awsglue.job import Job
+print('packages are IN')
+
+glueContext = GlueContext(SparkContext.getOrCreate())
+
+spark = SparkSession.builder.appName("temp") \
+    .config("spark.sql.parquet.writeLegacyFormat", "true") \
+    .config('spark.driver.extraJavaOptions', '-Duser.timezone=GMT+5:30') \
+    .config('spark.executor.extraJavaOptions', '-Duser.timezone=GMT+5:30') \
+    .getOrCreate()
+
+def readFromRedShift(spark: SparkSession, schema, tablename):
+    table = str(schema) + str(".") + str(tablename)
+    url = "jdbc:redshift://65.1.71.180:25439/analytics-dev-db"
+    dbdriver = "com.amazon.redshift.jdbc42.Driver"
+    dbuser = "ceat_mdb"
+    dbpassword = "Ceat_Apr_2019"
+    Prop = dict(driver=dbdriver, user=dbuser, password=dbpassword)
+    df = spark.read.jdbc(url=url, table=table, properties=Prop)
+    return df
+    
+####################Sales Detail Report#####################
+
+sales_full = readFromRedShift(spark, "botree_sfdc", "sales_detail_report")
+
+print('sales_full count')
+print(sales_full.count())
+print(sales_full.columns)
+
+today = date.today()
+print(today)
+curr_year = int(str(date.today())[:4])
+print('curr_year')
+print(curr_year)
+curr_month = int(str(date.today())[5:7])
+print('curr_month')
+print(curr_month)
+
+L12M_date = (today - timedelta(days=365)).strftime("%Y-%m-%d")
+print(L12M_date)
+# sales_filter = sales_full.filter(to_date(sales_full["invoicedate"])>= to_date(lit('2023-05-01')))
+sales_filter = sales_full.filter(to_date(sales_full["invoicedate"])>= to_date(lit(L12M_date)))
+print('sales_filter count')
+print(sales_filter.count())
+
+sales = sales_filter.withColumn('year',year(sales_filter.invoicedate))\
+            .withColumn('month',month(sales_filter.invoicedate))\
+            .withColumn("year",col("year").cast(StringType()))\
+            .withColumn("month",col("month").cast(StringType()))
+            
+print('sales done')
+# print(sales.dtypes)
+sales=sales.withColumn("period", concat_ws("-","year","month"))
+
+print(sales.select(sales.period).show())
+print(sales.columns)
+
+############## Model Data Base##############
+model_data = sales.select(col("dtcode"),col("customercode"),col("period"),col("month"),col("year"))
+# print('model_data')
+# print(model_data.count())
+model_data = model_data.distinct()
+# print('model_data')
+# print(model_data.count())
+model_data = model_data.toPandas()
+model_data['month']=model_data['month'].astype('int')
+model_data['year']=model_data['year'].astype('int')
+model_data['dtcode']=model_data['dtcode'].astype('str')
+model_data['customercode']=model_data['customercode'].astype('str')
+model_data['period']=model_data['period'].astype('str')
+# print(model_data.shape)
+# print(model_data.head())
+
+# Get latest DT codes against SubD codes
+latest_dt = model_data.groupby(['customercode','dtcode'],as_index=False).agg({'year':'max','month':'max'})
+# print('latest_dt')
+# print(latest_dt.head())
+# print(latest_dt.shape)
+latest_period = model_data.groupby(['customercode'],as_index=False).agg({'year':'max','month':'max'})
+# print('latest_period')
+# print(latest_period.head())
+# print(latest_period.shape)
+latest_dt = pd.merge(left = latest_dt, right = latest_period, on = ['customercode','year','month'], how = 'inner')
+# print('latest_dt subset')
+# print(latest_dt.head())
+# print(latest_dt.shape)
+
+subD_dt = latest_dt[['customercode','dtcode']]
+subD_dt = subD_dt.drop_duplicates()
+subD_dt = pd.DataFrame(subD_dt,columns= ['customercode','dtcode'])
+subD_dt.rename(columns = {'dtcode':'dtcode_old'},inplace=True)
+# print('subD_dt')
+# print(subD_dt.head())
+# print(subD_dt.shape)
+
+subd_code = [(subD_dt['customercode'] =='52000432R1440'),
+(subD_dt['customercode'] =='52000432R705'),
+(subD_dt['customercode'] =='52001585R1223'),
+(subD_dt['customercode'] =='52001632T0005'),
+(subD_dt['customercode'] =='52000011R4773')]
+
+dt_values = ['52000432','52000432','52030309','52030347','52030268']
+
+subD_dt['dtcode_new'] = np.select(subd_code,dt_values)
+
+# print(subD_dt[subD_dt['dtcode_new']!=0])
+
+subD_dt['dtcode'] = np.where((subD_dt['dtcode_new'] =='0'),subD_dt['dtcode_old'],subD_dt['dtcode_new'])
+
+# subD_dt['dtcode'] = np.where((subD_dt['customercode'] =='52000011R4773'), '52030268', subD_dt['dtcode_old'])
+# print('subD_dt')
+# print(subD_dt[~(subD_dt['dtcode_new']==0)])
+# print(subD_dt[subD_dt['dtcode_new']==0])
+
+subD_dt = pd.DataFrame(subD_dt,columns= ['customercode','dtcode_old','dtcode_new','dtcode'])
+subD_dt['flag'] = np.where(subD_dt['dtcode_old']==subD_dt['dtcode'],"True","False")
+# print('flag value count')
+# print(subD_dt['flag'].value_counts())
+subD_dt['flag_new'] = np.where(subD_dt['dtcode_new']==subD_dt['dtcode'],"True","False")
+# print('flag_new value count')
+# print(subD_dt['flag_new'].value_counts())
+# print('subD_dt')
+# print(subD_dt.head())
+# print('subD_dt[flag]==False')
+# print(subD_dt[subD_dt['flag']=="False"])
+# print('subD_dt[flag_new]==True')
+# print(subD_dt[subD_dt['flag_new']=="True"])
+subD_dt = subD_dt[['customercode','dtcode']]
+subD_dt = subD_dt.drop_duplicates()
+subD_dt = pd.DataFrame(subD_dt,columns = ['customercode','dtcode'])
+# print('subD_dt.shape')
+# print(subD_dt.shape)
+# print('subD_dt unique DT count')
+# print(subD_dt['dtcode'].nunique)
+
+del model_data['dtcode']
+model_data = model_data.drop_duplicates()
+model_data = pd.DataFrame(model_data,columns=['customercode','period','month','year'])
+# print(model_data.shape)
+
+model_data = pd.merge(left = model_data, right = subD_dt, on = ['customercode'], how='left')
+print('Unique DT Codes')
+print(model_data['dtcode'].nunique)
+print('Unique SubD Codes')
+print(model_data['customercode'].nunique)
+print(model_data.shape)
+print(model_data.head())
+n = model_data.nunique(axis=0)
+print("No.of.unique values in each column :\n",
+      n)
+
+latest_data = model_data[(model_data['year']==curr_year) & (model_data['month']==curr_month)]
+print('latest_data')
+print(latest_data.shape)
+print('latest_data unique customercodes')
+print(latest_data['customercode'].nunique())
+
+total_sales = sales.groupby("period").agg(sum("netamt").alias("netamt"))
+print(total_sales.count())
+total_sales = total_sales.toPandas()
+print('total_sales')
+print(total_sales.shape)
+print(total_sales.head())
+print(total_sales.columns)
+
+data = total_sales['period'].unique()
+data = pd.DataFrame(data,columns=['period'])
+data['date'] = pd.to_datetime(data['period'],format = '%Y-%m')
+data['seq'] = data['date'].rank()
+data.sort_values(by = ['seq'],inplace=True)
+print(data.head(2))
+
+total_sales = pd.merge(left = total_sales, right = data[['period','seq']] , on = ['period'], how = 'left')
+total_sales.sort_values(by = ['seq'],inplace=True)
+total_sales['seq_old']=total_sales['seq']
+total_sales['seq']=total_sales['seq_old']-1
+total_sales['diff'] = total_sales['netamt'].diff(periods=1)
+print('total_sales')
+print(total_sales.head())
+
+t_sales = total_sales[['seq_old','netamt']]
+t_sales = pd.DataFrame(t_sales)
+t_sales.rename(columns={'seq_old':'seq','netamt':'netamt_hist'},inplace=True)
+print('t_sales')
+print(t_sales.head())
+
+total_sales = pd.merge(left=total_sales, right = t_sales , on=['seq'], how = 'left')
+total_sales = total_sales.replace(np.nan,0)
+print('total_sales')
+print(total_sales.head())
+print(total_sales.dtypes)
+total_sales['diff'] = total_sales['diff'].astype(float)
+total_sales['netamt_hist'] = total_sales['netamt_hist'].astype(float)
+total_sales['increment%'] = round(((total_sales['diff']/total_sales['netamt_hist'])*100),0)
+print('total_sales')
+print(total_sales.dtypes)
+print(total_sales.head())
+
+model_data = pd.merge(left = model_data, right = total_sales[['period','increment%']], on = ['period'], how = 'left')
+print(model_data.head())
+print(model_data.shape)
+
+subd_sales = sales.groupby("period","customercode").agg(sum("netamt").alias("netamt"))
+print(subd_sales.count())
+subd_sales = subd_sales.toPandas()
+print(subd_sales.shape)
+subd_sales = pd.merge(left = subd_sales, right = data[['period','seq']] , on = ['period'], how = 'left')
+subd_sales.sort_values(by = ['customercode','seq'],inplace=True)
+subd_sales['seq_old']=subd_sales['seq']
+subd_sales['seq']=subd_sales['seq_old']-1
+subd_sales['diff'] = subd_sales.groupby(['customercode'])['netamt'].transform(lambda x: x.diff())
+print('subd_sales')
+print(subd_sales.head(2))
+
+subd_t_sales = subd_sales[['customercode','seq_old','netamt']]
+subd_t_sales = pd.DataFrame(subd_t_sales)
+subd_t_sales.rename(columns = {'seq_old':'seq','netamt':'netamt_hist'},inplace= True)
+
+subd_sales = pd.merge(left=subd_sales, right = subd_t_sales , on=['customercode','seq'], how = 'left')
+subd_sales = subd_sales.replace(np.nan,0)
+print('subd_sales')
+print(subd_sales.head())
+print(subd_sales.dtypes)
+subd_sales['diff'] = subd_sales['diff'].astype(float)
+subd_sales['netamt_hist'] = subd_sales['netamt_hist'].astype(float)
+subd_sales['subd_increment%'] = round(((subd_sales['diff']/subd_sales['netamt_hist'])*100),0)
+print('subd_sales')
+print(subd_sales.dtypes)
+print(subd_sales.head())
+
+model_data = pd.merge(left = model_data, right = subd_sales[['customercode','period','netamt','subd_increment%']], on = ['customercode','period'], how = 'left')
+print(model_data.head())
+print(model_data.shape)
+
+latest_data = model_data[(model_data['year']==curr_year) & (model_data['month']==curr_month)]
+print('latest_data')
+print(latest_data.shape)
+print('latest_data unique customercodes')
+print(latest_data['customercode'].nunique())
+
+cat_range = sales.groupby("period","customercode").agg(countDistinct("categorycode").alias("cat_range"))
+print(cat_range.count())
+cat_range = cat_range.toPandas()
+print('cat_range')
+print(cat_range.shape)
+
+sku_range = sales.groupby("period","customercode").agg(countDistinct("productcode").alias("sku_range"))
+print(sku_range.count())
+sku_range = sku_range.toPandas()
+print('sku_range')
+print(sku_range.shape)
+
+model_data = pd.merge(left = model_data, right = cat_range, on=['customercode','period'],how='left')
+model_data = pd.merge(left = model_data, right = sku_range, on=['customercode','period'],how='left')
+
+print(model_data.head())
+print('model_data shape')
+print(model_data.shape)
+
+latest_data = model_data[(model_data['year']==curr_year) & (model_data['month']==curr_month)]
+print('latest_data')
+print(latest_data.shape)
+print('latest_data unique customercodes')
+print(latest_data['customercode'].nunique())
+
+recent_date = sales.select(max(sales.invoicedate)).head()[0]
+# print(recent_date)
+L1M_date = (recent_date - timedelta(days=30)).strftime("%Y-%m-%d")
+L1M_date = pd.to_datetime(L1M_date)
+# print(L1M_date)
+L2M_date = (recent_date - timedelta(days=60)).strftime("%Y-%m-%d")
+L2M_date = pd.to_datetime(L2M_date)
+# print(L2M_date)
+L3M_date = (recent_date - timedelta(days=90)).strftime("%Y-%m-%d")
+L3M_date = pd.to_datetime(L3M_date)
+# print(L2M_date)
+recent_date=recent_date.strftime("%Y-%m-%d")
+recent_date = pd.to_datetime(recent_date)
+# print(recent_date)
+
+L3M_sales = sales.where((col("invoicedate")>L3M_date) & (col("invoicedate")<=recent_date))
+print(L3M_sales.columns)
+input_spark = L3M_sales.groupby("customercode","invoicedate").agg(sum("netamt").alias("netamt"))
+print('spark df groupby')
+print(input_spark.show())
+input_data = input_spark.toPandas()
+print('converted to pandas')
+Period_Conditions = [(input_data['invoicedate']<=recent_date) & (input_data['invoicedate']>L1M_date),
+                         (input_data['invoicedate']<=L1M_date) & (input_data['invoicedate']>L2M_date),
+                         (input_data['invoicedate']<=L2M_date) & (input_data['invoicedate']>L3M_date)]
+Period_values = ['L1M','L2M','L3M']
+input_data['Periodicity'] = np.select(Period_Conditions,Period_values)
+Periodicity_conditions =[(input_data['Periodicity']=='L1M'),(input_data['Periodicity']=='L2M'),(input_data['Periodicity']=='L3M')]
+input_data = input_data[~(input_data['Periodicity'] == '0')]
+
+subd_data_new = pd.pivot_table(input_data,index=['customercode'],values='netamt',columns='Periodicity',aggfunc='sum', fill_value=0)
+subd_data_new=subd_data_new.reset_index()
+subd_data_new.columns = subd_data_new.columns.get_level_values(0)
+subd_data_new = pd.DataFrame(subd_data_new.to_records())
+del subd_data_new['index']
+print(subd_data_new.head())
+
+subd_data_new['Churn_flag'] = np.where(((subd_data_new['L1M']==0) & (subd_data_new['L2M']==0) & (subd_data_new['L3M']==0)),"Y","N")
+print('Churn_flag')
+print(subd_data_new['Churn_flag'].unique())
+subd_data_new['Churn_risk_flag'] = np.where(((subd_data_new['L2M']==0) & (subd_data_new['L3M']==0)),"Y","N")
+print('Churn_risk_flag')
+print(subd_data_new['Churn_risk_flag'].unique())
+subd_data_new['L3M_Declining_sale'] = np.where(((subd_data_new['L1M']>=subd_data_new['L2M']) & (subd_data_new['L2M']>=subd_data_new['L3M'])),"Y","N")
+print('L3M_Declining_sale')
+print(subd_data_new['L3M_Declining_sale'].unique())
+subd_data_new['L3M_0_sale'] = np.where(((subd_data_new['L1M']==0) | (subd_data_new['L2M']==0) | (subd_data_new['L3M']==0)),"Y","N")
+print('L3M_0_sale')
+print(subd_data_new['L3M_0_sale'].unique())
+
+model_data = pd.merge(left = model_data, right = subd_data_new[['customercode','Churn_flag','Churn_risk_flag','L3M_Declining_sale','L3M_0_sale']], on=['customercode'],how='left')
+print(model_data['Churn_flag'].unique())
+print(model_data['Churn_risk_flag'].unique())
+print(model_data['L3M_Declining_sale'].unique())
+print(model_data['L3M_0_sale'].unique())
+print('model_data')
+print(model_data.shape)
+print(model_data.head(2))
+
+latest_data = model_data[(model_data['year']==curr_year) & (model_data['month']==curr_month)]
+print('latest_data')
+print(latest_data.shape)
+print('latest_data unique customercodes')
+print(latest_data['customercode'].nunique())
+
+connection = pg.connect(host='**.*.**.***',database='********-***-**',user='****_***',password='****************',port=*****)
+curs = connection.cursor()
+print('Connection Done!!')
+
+# # ############## Collection Master #######################
+print('Collection Master')
+# curs.execute("select * from botree_sfdc.collection_master_report where datecollection >='2022-04-01';")
+curs.execute("select * from botree_sfdc.collection_master_report where source = 'SFDC';")
+# curs.execute("select * from botree_sfdc.collection_master_report where datecollection >='{L12M_date}' and source = 'SFDC';")
+data_col_mast = curs.fetchall()
+collection_master = pd.DataFrame(data_col_mast,columns=["referenceno","datecollection","subdealercode","subdealername","distcode","distname","invoiceamt","pending","paymentmode","remarks","adjusted","invno","source"])
+print('collection_master done')
+collection_master['datecollection']=pd.to_datetime(collection_master['datecollection'])
+print('collection_master[datecollection] conversion done')
+#collection_master = collection_master[collection_master['datecollection']>=datetime.strptime(L12M_date, '%Y-%m-%d')]
+collection_master = collection_master[collection_master['datecollection']>=L12M_date]
+print('collection_master.shape')
+print(collection_master.shape)
+print(collection_master.head())
+
+
+collection_master['period']= (pd.DatetimeIndex(collection_master['datecollection']).year).astype('str')+"-"+(pd.DatetimeIndex(collection_master['datecollection']).month).astype('str')
+
+collection_master_sd = collection_master.groupby(['subdealercode','period'],as_index=False).agg({'adjusted':'sum'})
+collection_master_sd['adjusted']=collection_master_sd['adjusted'].replace(np.nan,0)
+collection_master_sd = collection_master_sd.replace('null',0)
+collection_master_sd['adjusted'] = pd.to_numeric(collection_master_sd['adjusted'], errors='coerce')
+collection_master_sd['adjusted'] = collection_master_sd['adjusted'].astype(float)
+print('collection_master_sd')
+print(collection_master_sd.head())
+print(collection_master_sd.shape)
+
+collection_master_sd.rename(columns={'subdealercode':'customercode'},inplace=True)
+
+model_data = pd.merge(left = model_data, right = collection_master_sd, on = ['customercode','period'],how = 'left')
+print(model_data.head())
+model_data['subd_increment%'] = model_data['subd_increment%'].replace(np.nan,0)
+model_data['increment%'] = model_data['increment%'].replace(np.nan,0)
+model_data['subd_increment%'] = model_data['subd_increment%'].astype('float')
+model_data['increment%'] = model_data['increment%'].astype('float')
+model_data['increment_less_than_national']=np.where(model_data['subd_increment%']>=model_data['increment%'],"At Par","Less than national")
+print(model_data.head())
+print('Final model data shape')
+print(model_data.shape)
+print(model_data.dtypes)
+
+latest_data = model_data[(model_data['year']==curr_year) & (model_data['month']==curr_month)]
+print('latest_data')
+print(latest_data.shape)
+print('latest_data unique customercodes')
+print(latest_data['customercode'].nunique())
+
+####################################################
+model_data['data_preparation_date'] = date.today()
+print(model_data['data_preparation_date'].unique())
+
+model_data = model_data.astype(str)
+print(model_data.head())
+
+spark1 = SparkSession.builder.appName('ideal_dt_parameters').getOrCreate()
+model_data_spark = spark1.createDataFrame(data=model_data)
+print('model_data_spark created')
+print(model_data_spark.show())
+
+model_data_spark.coalesce(1).write.option("header", "true").option("escape",'"').mode("overwrite").csv("s3://sub-dealer-churn-model/model-base-data/subdchurn_input_new.csv")
+
+# curs.execute("DELETE FROM dwh.subdchurn_input_new")
+# print('Deleted from redhsift')
+
+# def writeIntoRedshiftUsingGlue(glueContext, df):
+#     session = boto3.session.Session()
+#     client = session.client(service_name='secretsmanager', region_name='**-*******-*')
+#     get_secret_value_response = client.get_secret_value(SecretId='*********')
+#     secret = json.loads(get_secret_value_response['SecretString'])
+#     dbuser = secret['username']
+#     dbpassword = secret['password']
+#     dbhost = secret['dbhost']
+#     dbport = int(secret['port'])
+#     dbname = secret['dbname']
+#     dbdriver = secret['dbdriver']
+#     url = "jdbc:redshift://{}:{}/{}".format(dbhost, str(dbport), dbname)
+#     tempPath = "s3://ceat-prd-edl-standard/SALES/DT_ROI/temp/"
+#     table = "dwh.subdchurn_input_new"
+#     log.info("::::Table Name is {}".format(table))
+#     conn_options = {
+#         "dbtable": table,
+#         "database": dbname
+#     }
+#     try:
+#         datasource0 = DynamicFrame.fromDF(df, glueContext, "datasource0")
+#         glueContext.write_dynamic_frame.from_jdbc_conf(frame=datasource0,
+#                                                       catalog_connection='dwh_redshift',
+#                                                       connection_options=conn_options,
+#                                                       redshift_tmp_dir=tempPath)
+#         return "Success"
+#     except Exception as e:
+#         log.error(e, exc_info=True)
+#         return str("Exception -" + str(e))
+
+# writeIntoRedshiftUsingGlue(glueContext, model_data_spark)
+# print('Written in redshift')
+
+
+
+
+
+
+
+
