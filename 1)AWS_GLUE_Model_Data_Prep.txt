@@ -33,10 +33,10 @@ spark = SparkSession.builder.appName("temp") \
 
 def readFromRedShift(spark: SparkSession, schema, tablename):
     table = str(schema) + str(".") + str(tablename)
-    url = "jdbc:redshift://65.1.71.180:25439/analytics-dev-db"
-    dbdriver = "com.amazon.redshift.jdbc42.Driver"
-    dbuser = "ceat_mdb"
-    dbpassword = "Ceat_Apr_2019"
+    url = "****:*****://**.*.**.***:*****/*********"
+    dbdriver = "***.********.********.********"
+    dbuser = "*******"
+    dbpassword = "*****************"
     Prop = dict(driver=dbdriver, user=dbuser, password=dbpassword)
     df = spark.read.jdbc(url=url, table=table, properties=Prop)
     return df
@@ -409,48 +409,12 @@ print(model_data['data_preparation_date'].unique())
 model_data = model_data.astype(str)
 print(model_data.head())
 
-spark1 = SparkSession.builder.appName('ideal_dt_parameters').getOrCreate()
+spark1 = SparkSession.builder.appName('************').getOrCreate()
 model_data_spark = spark1.createDataFrame(data=model_data)
 print('model_data_spark created')
 print(model_data_spark.show())
 
 model_data_spark.coalesce(1).write.option("header", "true").option("escape",'"').mode("overwrite").csv("s3://sub-dealer-churn-model/model-base-data/subdchurn_input_new.csv")
-
-# curs.execute("DELETE FROM dwh.subdchurn_input_new")
-# print('Deleted from redhsift')
-
-# def writeIntoRedshiftUsingGlue(glueContext, df):
-#     session = boto3.session.Session()
-#     client = session.client(service_name='secretsmanager', region_name='**-*******-*')
-#     get_secret_value_response = client.get_secret_value(SecretId='*********')
-#     secret = json.loads(get_secret_value_response['SecretString'])
-#     dbuser = secret['username']
-#     dbpassword = secret['password']
-#     dbhost = secret['dbhost']
-#     dbport = int(secret['port'])
-#     dbname = secret['dbname']
-#     dbdriver = secret['dbdriver']
-#     url = "jdbc:redshift://{}:{}/{}".format(dbhost, str(dbport), dbname)
-#     tempPath = "s3://ceat-prd-edl-standard/SALES/DT_ROI/temp/"
-#     table = "dwh.subdchurn_input_new"
-#     log.info("::::Table Name is {}".format(table))
-#     conn_options = {
-#         "dbtable": table,
-#         "database": dbname
-#     }
-#     try:
-#         datasource0 = DynamicFrame.fromDF(df, glueContext, "datasource0")
-#         glueContext.write_dynamic_frame.from_jdbc_conf(frame=datasource0,
-#                                                       catalog_connection='dwh_redshift',
-#                                                       connection_options=conn_options,
-#                                                       redshift_tmp_dir=tempPath)
-#         return "Success"
-#     except Exception as e:
-#         log.error(e, exc_info=True)
-#         return str("Exception -" + str(e))
-
-# writeIntoRedshiftUsingGlue(glueContext, model_data_spark)
-# print('Written in redshift')
 
 
 
