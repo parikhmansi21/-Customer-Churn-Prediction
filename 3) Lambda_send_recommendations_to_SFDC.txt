@@ -1,0 +1,94 @@
+import json
+import boto3
+import os
+import pandas as pd
+import requests
+from requests.auth import HTTPBasicAuth
+import base64
+from botocore.exceptions import ClientError
+import random
+import pymysql
+import psycopg2
+import datetime as dt
+from datetime import date, timedelta, datetime
+import io
+from io import StringIO
+print('import packages')
+
+def lambda_handler(event, context):
+    secret_name = "Redshift_Access"
+    region_name = "ap-south-1"
+    message = "This is start of the message SUB-DEALER FREQUENTLY PURCHASED PRODUCTS USING LOGIC \n"
+    count_of_rows = 0
+    connection = None
+    dbuser = None
+    dbpassword = None
+    dbengine = None
+    dbcluster = None
+    dbhost = None
+    dbport = None
+    dbname = None
+    dbhost_ip = None
+    AWS_ACCESS_KEY_ID=None
+    AWS_SECRET_ACCESS_KEY=None
+
+    # Create a Secrets Manager client
+    session = boto3.session.Session()
+    client = session.client(
+        service_name='secretsmanager',
+        region_name=region_name
+    )
+    try:
+        get_secret_value_response = client.get_secret_value(SecretId=secret_name)
+        secret = json.loads(get_secret_value_response['SecretString'])
+        dbuser = secret['username']
+        dbpassword = secret['password']
+        dbengine = secret['engine']
+        dbcluster = secret['dbClusterIdentifier']
+        dbhost = secret['host']
+        dbport = int(secret['port'])
+        dbname = secret['dbname']
+        dbhost_ip = secret['dbhost']
+        AWS_ACCESS_KEY_ID = secret['AWS_ACCESS_KEY_ID']
+        AWS_SECRET_ACCESS_KEY = secret['AWS_SECRET_ACCESS_KEY']
+        AWS_S3_BUCKET = 'subdealer-freq-purchased'
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'DecryptionFailureException':
+            raise e
+        elif e.response['Error']['Code'] == 'InternalServiceErrorException':
+            raise e
+        elif e.response['Error']['Code'] == 'InvalidParameterException':
+            raise e
+        elif e.response['Error']['Code'] == 'InvalidRequestException':
+            raise e
+        elif e.response['Error']['Code'] == 'ResourceNotFoundException':
+            raise e
+    connection = psycopg2.connect(host=dbhost,dbname=dbname,user=dbuser,password=dbpassword,port=dbport)
+    print("connection successfull")
+    curs = connection.cursor()
+    try:
+        curs.execute("begin;")
+        query1 = """begin;DELETE FROM analytics_db.subdealer_churn_ml;
+        copy analytics_db.subdealer_churn_ml (customercode,Propensity_to_churn_model_output) from 's3://sub-dealer-churn-model/model_output.csv' credentials 'aws_access_key_id={};aws_secret_access_key={}' region'ap-south-1' FORMAT AS CSV ignoreheader 1;
+        INSERT INTO analytics_db.archive_subdealer_churn_ml (SELECT * FROM analytics_db.subdealer_churn_ml);end;""".format(AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY)
+        print(query1)
+        curs.execute(query1)
+        connection.commit()
+        curs.close()
+        connection.close()
+    except ClientError as e:
+        message = e
+        connection.commit()
+        curs.close()
+        connection.close()
+        raise e
+    finally:
+        sns = boto3.client('sns')
+        alertTopic = 'RecoEngine_CreateRecommendations_Notification' 
+        snsTopicArn = [t['TopicArn'] for t in sns.list_topics()['Topics'] if t['TopicArn'].lower().endswith(':' +alertTopic.lower())][0]
+        # Send message to SNS 
+        sns.publish( TopicArn=snsTopicArn, Message=message, Subject='SubDealer_Top_freq_purchased_Notification!', MessageStructure='raw')
+    return None
+    connection.commit()
+    curs.close()
+    connection.close()
